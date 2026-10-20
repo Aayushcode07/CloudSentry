@@ -1,3 +1,4 @@
+
 import hashlib
 import json
 import sys
@@ -6,269 +7,692 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-# Project path
+# --------------------------------------------------
+# 1. PROJECT CONFIGURATION
+# --------------------------------------------------
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from detection.rules import detect_threats
-from investigation.manager import (
-    create_investigation,
-    update_investigation,
-)
+from detection.aws_cloudtrail import fetch_cloudtrail_events
 from database.storage import (
     initialize_database,
     save_investigation,
     load_investigations,
 )
+from investigation.manager import (
+    create_investigation,
+    update_investigation,
+)
 
 DATA_FILE = PROJECT_ROOT / "sample-data" / "sample_events.json"
 
-# Page settings
 st.set_page_config(
-    page_title="CloudSentry",
+    page_title="CloudSentry | Security Operations",
     page_icon="🛡️",
     layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-st.title("🛡️ CloudSentry")
-st.subheader("Cloud Security Monitoring Dashboard")
-st.write("Monitor cloud activity and investigate suspicious events.")
-
-# Initialize persistent database
+# Initialize the existing SQLite database.
 initialize_database()
 
-# Load investigations from SQLite
-if "investigations" not in st.session_state:
-    st.session_state.investigations = load_investigations()
+# --------------------------------------------------
+# 2. CUSTOM DESIGN
+# --------------------------------------------------
+st.markdown(
+    """
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Manrope:wght@400;500;600;700;800&display=swap');
 
-# Load security events
-def load_events():
-    with DATA_FILE.open("r", encoding="utf-8") as file:
+    :root {
+        --bg: #0a101b;
+        --panel: #111b2a;
+        --border: #26354a;
+        --text: #e8eef7;
+        --muted: #91a1b7;
+        --teal: #48e0c1;
+    }
+
+    html, body, [class*="css"] {
+        font-family: 'Manrope', sans-serif;
+    }
+
+    .stApp {
+        background:
+            radial-gradient(ellipse at 12% 0%, #142b3a 0%, transparent 38%),
+            var(--bg);
+        color: var(--text);
+    }
+
+    [data-testid="stHeader"] {
+        background: rgba(10, 16, 27, 0.85);
+    }
+
+    [data-testid="stSidebar"] {
+        background: #0c1421;
+        border-right: 1px solid var(--border);
+    }
+
+    h1, h2, h3 {
+        color: var(--text) !important;
+        letter-spacing: -0.035em;
+    }
+
+    p, label {
+        color: #d4deeb;
+    }
+
+    .cs-brand {
+        font-size: 25px;
+        font-weight: 800;
+        color: #f0f6ff;
+        padding: 8px 0;
+    }
+
+    .cs-kicker {
+        color: var(--teal);
+        font-family: 'DM Mono', monospace;
+        font-size: 11px;
+        letter-spacing: 2px;
+        margin-bottom: 10px;
+    }
+
+    .cs-hero {
+        padding: 28px;
+        background: linear-gradient(115deg, #142b3b, #111d2d, #172438);
+        border: 1px solid #2a4354;
+        border-radius: 18px;
+        margin-bottom: 24px;
+    }
+
+    .cs-hero h1 {
+        font-size: 36px;
+        font-weight: 800;
+        margin-bottom: 8px;
+    }
+
+    .cs-hero p {
+        color: #a9bbcf;
+        font-size: 14px;
+        line-height: 1.8;
+    }
+
+    [data-testid="stMetric"] {
+        background: linear-gradient(145deg, #142033, #101927);
+        border: 1px solid var(--border);
+        padding: 17px;
+        border-radius: 13px;
+    }
+
+    [data-testid="stMetricLabel"] {
+        color: #9bacc1 !important;
+    }
+
+    [data-testid="stMetricValue"] {
+        color: #f0f6ff !important;
+        font-weight: 800;
+    }
+
+    .cs-panel {
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 13px;
+        padding: 18px;
+        margin-bottom: 15px;
+    }
+
+    .stButton > button {
+        background: #17423f;
+        color: #eafffa;
+        border: 1px solid #347a72;
+        border-radius: 8px;
+        font-weight: 700;
+        min-height: 40px;
+    }
+
+    .stButton > button:hover {
+        background: #20564f;
+        color: white;
+        border-color: var(--teal);
+    }
+
+    [data-testid="stDataFrame"] {
+        border: 1px solid var(--border);
+        border-radius: 10px;
+    }
+
+    hr {
+        border-color: var(--border);
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+# --------------------------------------------------
+# 3. HELPER FUNCTIONS
+# --------------------------------------------------
+def load_sample_events():
+    """Load local sample events."""
+    if not DATA_FILE.exists():
+        return []
+
+    with open(DATA_FILE, "r", encoding="utf-8") as file:
         data = json.load(file)
 
-    if not isinstance(data, list):
-        raise ValueError("The JSON file must contain a list of events.")
+    if isinstance(data, dict):
+        data = data.get("Records", [])
 
-    return data
+    return data if isinstance(data, list) else []
 
 
-try:
-    events = load_events()
-    alerts = detect_threats(events)
-except (OSError, json.JSONDecodeError, ValueError) as error:
-    st.error(f"Unable to load security events: {error}")
-    st.stop()
+def normalize_aws_events(raw_events):
+    """Normalize CloudTrail identity information."""
+    normalized = []
 
-# Prepare activity table
-event_rows = [
-    {
-        "Event": event.get("eventName", "Unknown"),
-        "User": event.get("userName", "Unknown"),
-        "Source IP": event.get("sourceIPAddress", "Unknown"),
-        "Result": "Failed" if event.get("errorCode") else "Recorded",
-    }
-    for event in events
-]
+    for event in raw_events:
+        item = dict(event)
+        identity = item.get("userIdentity", {})
 
-events_df = pd.DataFrame(
-    event_rows,
-    columns=["Event", "User", "Source IP", "Result"],
-)
+        if isinstance(identity, dict):
+            item["userName"] = (
+                identity.get("userName")
+                or identity.get("principalId")
+                or identity.get("arn")
+                or "Unknown"
+            )
 
-alerts_df = pd.DataFrame(
-    alerts,
-    columns=["eventName", "severity", "reason", "user"],
-)
-
-high_count = sum(
-    alert["severity"] == "High" for alert in alerts
-)
-
-# Dashboard metrics
-open_count = sum(
-    item["status"] == "Open"
-    for item in st.session_state.investigations
-)
-
-col1, col2, col3, col4 = st.columns(4)
-col1.metric("Total Events", len(events))
-col2.metric("Active Alerts", len(alerts))
-col3.metric("High Severity", high_count)
-col4.metric("Open Investigations", open_count)
-
-# Security Activity Explorer
-st.divider()
-st.header("🔎 Security Activity Explorer")
-
-search = st.text_input("Search events or users")
-filtered_events = events_df
-
-if search:
-    mask = events_df.astype(str).apply(
-        lambda column: column.str.contains(
-            search, case=False, na=False
+        item["eventName"] = item.get("eventName", "Unknown")
+        item["sourceIPAddress"] = item.get(
+            "sourceIPAddress", "Unknown"
         )
-    ).any(axis=1)
 
-    filtered_events = events_df[mask]
+        normalized.append(item)
 
-st.dataframe(filtered_events, use_container_width=True)
+    return normalized
 
-# Threat Detection Alerts
-st.divider()
-st.header("🚨 Threat Detection Alerts")
 
-if alerts_df.empty:
-    st.success("No suspicious events detected.")
+def event_dataframe(events):
+    """Convert security events into a table."""
+    return pd.DataFrame([
+        {
+            "Event": event.get("eventName", "Unknown"),
+            "User": event.get("userName", "Unknown"),
+            "Source IP": event.get("sourceIPAddress", "Unknown"),
+            "Error": event.get("errorCode", "None"),
+            "Region": event.get("awsRegion", "Unknown"),
+        }
+        for event in events
+    ])
+
+
+def evidence_hash(events):
+    """Calculate a SHA-256 fingerprint of the loaded evidence."""
+    content = json.dumps(
+        events, sort_keys=True, default=str
+    ).encode("utf-8")
+
+    return hashlib.sha256(content).hexdigest()
+
+
+def hero(title, description):
+    """Display a consistent page header."""
+    st.markdown(
+        f"""
+        <div class="cs-hero">
+            <div class="cs-kicker">CLOUDSENTRY / SECURITY OPERATIONS</div>
+            <h1>{title}</h1>
+            <p>{description}</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def get_severity_counts(alert_list):
+    high = sum(
+        1 for a in alert_list
+        if str(a.get("severity", "")).lower() == "high"
+    )
+    medium = sum(
+        1 for a in alert_list
+        if str(a.get("severity", "")).lower() == "medium"
+    )
+    critical = sum(
+        1 for a in alert_list
+        if str(a.get("severity", "")).lower() == "critical"
+    )
+    return high, medium, critical
+
+
+# --------------------------------------------------
+# 4. SIDEBAR AND DATA SOURCE
+# --------------------------------------------------
+with st.sidebar:
+    st.markdown(
+        '<div class="cs-brand">🛡️ CloudSentry</div>',
+        unsafe_allow_html=True,
+    )
+    st.caption("CLOUD SECURITY MONITORING")
+    st.divider()
+
+    page = st.radio(
+        "NAVIGATION",
+        [
+            "Overview",
+            "Event Explorer",
+            "Threat Alerts",
+            "Investigations",
+            "Evidence Integrity",
+        ],
+    )
+
+    st.divider()
+    st.subheader("Event data source")
+
+    data_source = st.selectbox(
+        "Choose source",
+        ["Local Sample Data", "AWS CloudTrail"],
+    )
+
+    aws_region = st.selectbox(
+        "AWS Region",
+        ["ap-south-1", "us-east-1", "us-west-2", "eu-west-1"],
+        disabled=(data_source != "AWS CloudTrail"),
+    )
+
+    fetch_clicked = st.button(
+        "Fetch AWS events",
+        disabled=(data_source != "AWS CloudTrail"),
+        use_container_width=True,
+    )
+
+
+# --------------------------------------------------
+# 5. LOAD EVENTS
+# --------------------------------------------------
+if "cloudsentry_aws_events" not in st.session_state:
+    st.session_state.cloudsentry_aws_events = None
+
+if "cloudsentry_aws_error" not in st.session_state:
+    st.session_state.cloudsentry_aws_error = None
+
+if fetch_clicked:
+    try:
+        with st.spinner("Fetching CloudTrail event history..."):
+            raw_events = fetch_cloudtrail_events(
+                region=aws_region,
+                max_results=20,
+            )
+
+        st.session_state.cloudsentry_aws_events = (
+            normalize_aws_events(raw_events)
+        )
+        st.session_state.cloudsentry_aws_error = None
+
+    except Exception as error:
+        st.session_state.cloudsentry_aws_events = None
+        st.session_state.cloudsentry_aws_error = str(error)
+
+if data_source == "AWS CloudTrail":
+    events = st.session_state.cloudsentry_aws_events
+
+    if events is None:
+        events = load_sample_events()
+        st.info(
+            "AWS events are unavailable. Showing local sample data. "
+            "Configure AWS credentials and fetch events to use AWS data."
+        )
+
+    if st.session_state.cloudsentry_aws_error:
+        st.warning(
+            "AWS fetch failed: "
+            + st.session_state.cloudsentry_aws_error
+        )
+
+    source_label = (
+        "AWS CloudTrail"
+        if st.session_state.cloudsentry_aws_events is not None
+        else "Local Sample Data"
+    )
 else:
-    st.dataframe(alerts_df, use_container_width=True)
+    events = load_sample_events()
+    source_label = "Local Sample Data"
 
-# Incident Investigation
-st.divider()
-st.header("🕵️ Incident Investigation")
-
-st.write(
-    "Create investigations from detected alerts, track their status, "
-    "and save investigation notes permanently."
+# --------------------------------------------------
+# 6. THREAT DETECTION
+# --------------------------------------------------
+alerts = detect_threats(events)
+high_alerts, medium_alerts, critical_alerts = get_severity_counts(
+    alerts
 )
 
-if not alerts:
-    st.info("There are no detected alerts to investigate.")
-else:
-    for index, alert in enumerate(alerts):
-        st.subheader(
-            f"{alert.get('eventName', 'Unknown')} "
-            f"— {alert.get('severity', 'Unknown')}"
-        )
-        st.write("**User:**", alert.get("user", "Unknown"))
-        st.write("**Reason:**", alert.get("reason", "Not provided"))
+# --------------------------------------------------
+# 7. OVERVIEW
+# --------------------------------------------------
+if page == "Overview":
+    hero(
+        "Security Operations Center",
+        "Monitor cloud events, identify suspicious activity, "
+        "and preserve evidence for security investigations.",
+    )
 
-        already_created = any(
-            item.get("eventName") == alert.get("eventName")
-            and item.get("user") == alert.get("user", "Unknown")
-            and item.get("reason") == alert.get("reason")
-            for item in st.session_state.investigations
-        )
+    st.markdown("### Security overview")
 
-        if not already_created:
-            if st.button(
-                "Create Investigation",
-                key=f"create_incident_{index}",
-            ):
-                incident = create_investigation(alert)
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Events Loaded", len(events))
+    col2.metric("Threat Alerts", len(alerts))
+    col3.metric("High / Critical", high_alerts + critical_alerts)
+    col4.metric("Medium Alerts", medium_alerts)
 
-                # Save permanently to SQLite
-                save_investigation(incident)
+    left, right = st.columns([1.35, 1])
 
-                # Update current dashboard session
-                st.session_state.investigations.append(incident)
+    with left:
+        st.markdown("### Recent security events")
+        df = event_dataframe(events)
 
-                st.success("Investigation saved to the database.")
-                st.rerun()
+        if not df.empty:
+            st.dataframe(
+                df.head(8),
+                use_container_width=True,
+                hide_index=True,
+            )
         else:
-            st.caption("An investigation already exists for this alert.")
+            st.info("No events are available.")
 
-        st.divider()
+    with right:
+        st.markdown("### Detection summary")
 
-# Manage existing investigations
-st.subheader("📋 Investigation Records")
+        if alerts:
+            for alert in alerts[:6]:
+                st.markdown(
+                    f"""
+                    <div class="cs-panel">
+                        <b>{str(alert.get('severity', 'Unknown')).upper()}</b>
+                        · {alert.get('eventName', 'Unknown')}<br>
+                        <small>User: {alert.get('user', 'Unknown')}</small><br>
+                        <small>{alert.get('reason', 'No description')}</small>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+        else:
+            st.success("No threats detected by the configured rules.")
 
-if not st.session_state.investigations:
-    st.info("No investigations created yet.")
-else:
-    for incident in st.session_state.investigations:
-        with st.expander(
-            f"{incident['id']} — {incident['eventName']} "
-            f"({incident['status']})"
-        ):
-            st.write("**Severity:**", incident["severity"])
-            st.write("**User:**", incident["user"])
-            st.write("**Reason:**", incident["reason"])
-            st.write("**Created:**", incident["created_at"])
+    st.caption(
+        f"Data source: {source_label} · "
+        "AWS mode fetches event history on demand; "
+        "it is not continuous real-time monitoring."
+    )
 
-            with st.form(key=f"form_{incident['id']}"):
+# --------------------------------------------------
+# 8. EVENT EXPLORER
+# --------------------------------------------------
+elif page == "Event Explorer":
+    hero(
+        "Event Explorer",
+        "Search and review the security events available to CloudSentry.",
+    )
+
+    df = event_dataframe(events)
+
+    if df.empty:
+        st.info("No events are available.")
+    else:
+        search_text = st.text_input(
+            "Search events",
+            placeholder="Search by event, user, IP, or error...",
+        )
+
+        filtered_df = df.copy()
+
+        if search_text:
+            mask = filtered_df.astype(str).apply(
+                lambda column: column.str.contains(
+                    search_text,
+                    case=False,
+                    na=False,
+                    regex=False,
+                )
+            ).any(axis=1)
+
+            filtered_df = filtered_df[mask]
+
+        st.caption(f"{len(filtered_df)} matching events")
+        st.dataframe(
+            filtered_df,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.download_button(
+            "Export events as CSV",
+            data=filtered_df.to_csv(index=False).encode("utf-8"),
+            file_name="cloudsentry_events.csv",
+            mime="text/csv",
+        )
+
+# --------------------------------------------------
+# 9. THREAT ALERTS
+# --------------------------------------------------
+elif page == "Threat Alerts":
+    hero(
+        "Threat Alerts",
+        "Review suspicious activities detected by CloudSentry's "
+        "configured security rules.",
+    )
+
+    if not alerts:
+        st.success("No threats detected in the loaded events.")
+    else:
+        filter_severity = st.selectbox(
+            "Filter by severity",
+            ["All", "Critical", "High", "Medium", "Low"],
+        )
+
+        filtered_alerts = [
+            alert for alert in alerts
+            if filter_severity == "All"
+            or str(alert.get("severity", "")).lower()
+            == filter_severity.lower()
+        ]
+
+        st.metric("Matching Alerts", len(filtered_alerts))
+
+        for index, alert in enumerate(filtered_alerts, start=1):
+            severity = str(alert.get("severity", "Unknown")).upper()
+
+            with st.expander(
+                f"{index}. [{severity}] "
+                f"{alert.get('eventName', 'Unknown')}",
+                expanded=(severity in ["CRITICAL", "HIGH"]),
+            ):
+                st.write("**User:**", alert.get("user", "Unknown"))
+                st.write(
+                    "**Reason:**",
+                    alert.get("reason", "No reason provided"),
+                )
+                st.write(
+                    "**Event:**",
+                    alert.get("eventName", "Unknown"),
+                )
+
+                if st.button(
+                    "Create investigation from this alert",
+                    key=f"create_incident_{index}",
+                ):
+                    incident = create_investigation(alert)
+                    save_investigation(incident)
+                    st.success(
+                        f"Investigation {incident['id']} saved to SQLite."
+                    )
+
+# --------------------------------------------------
+# 10. INVESTIGATIONS — PERSISTENT SQLITE STORAGE
+# --------------------------------------------------
+elif page == "Investigations":
+    hero(
+        "Investigation Workspace",
+        "Create investigations from security alerts, add notes, "
+        "and track their status. Records are stored in SQLite.",
+    )
+
+    # Create a new investigation from an existing detected alert.
+    st.markdown("### Create an investigation")
+
+    if alerts:
+        alert_labels = [
+            (
+                f"{alert.get('eventName', 'Unknown')} | "
+                f"{alert.get('user', 'Unknown')} | "
+                f"{alert.get('severity', 'Medium')}"
+            )
+            for alert in alerts
+        ]
+
+        selected_index = st.selectbox(
+            "Select the alert to investigate",
+            range(len(alerts)),
+            format_func=lambda i: alert_labels[i],
+        )
+
+        initial_notes = st.text_area(
+            "Investigation notes",
+            key="new_investigation_notes",
+            placeholder="Describe what should be investigated...",
+        )
+
+        if st.button("Create and save investigation"):
+            incident = create_investigation(alerts[selected_index])
+            incident["notes"] = initial_notes.strip()
+
+            try:
+                save_investigation(incident)
+                st.success(
+                    f"Investigation {incident['id']} saved permanently."
+                )
+                st.rerun()
+            except Exception as error:
+                st.error(f"Could not save investigation: {error}")
+    else:
+        st.info(
+            "No alerts are available to investigate. "
+            "Load events that trigger your detection rules first."
+        )
+
+    st.divider()
+    st.markdown("### Saved investigation records")
+
+    try:
+        investigations = load_investigations()
+    except Exception as error:
+        investigations = []
+        st.error(f"Could not load investigations: {error}")
+
+    if not investigations:
+        st.info(
+            "No saved investigations yet. Create one above or "
+            "create one from the Threat Alerts page."
+        )
+    else:
+        st.caption(f"{len(investigations)} investigation(s) stored in SQLite")
+
+        for incident in investigations:
+            incident_id = incident["id"]
+
+            with st.expander(
+                f"{incident['eventName']} · {incident['severity']} · "
+                f"{incident['status']} · {incident_id}"
+            ):
+                st.write("**Event:**", incident["eventName"])
+                st.write("**User:**", incident["user"])
+                st.write("**Reason:**", incident["reason"])
+                st.write("**Created:**", incident["created_at"])
+
+                status_options = ["Open", "In Progress", "Resolved"]
+                current_status = incident.get("status", "Open")
+
+                if current_status not in status_options:
+                    current_status = "Open"
+
+                status_index = status_options.index(current_status)
+
                 new_status = st.selectbox(
-                    "Investigation Status",
-                    ["Open", "In Progress", "Resolved"],
-                    index=[
-                        "Open",
-                        "In Progress",
-                        "Resolved",
-                    ].index(incident["status"]),
+                    "Investigation status",
+                    status_options,
+                    index=status_index,
+                    key=f"status_{incident_id}",
                 )
 
                 new_notes = st.text_area(
-                    "Investigation Notes",
-                    value=incident["notes"],
-                    placeholder="Describe your findings and actions...",
+                    "Investigation notes",
+                    value=incident.get("notes", ""),
+                    key=f"notes_{incident_id}",
                 )
 
-                save = st.form_submit_button("Save Investigation")
+                if st.button(
+                    "Save changes",
+                    key=f"save_{incident_id}",
+                ):
+                    try:
+                        updated_incident = update_investigation(
+                            incident,
+                            status=new_status,
+                            notes=new_notes,
+                        )
+                        save_investigation(updated_incident)
+                        st.success("Investigation changes saved to SQLite.")
+                        st.rerun()
+                    except Exception as error:
+                        st.error(f"Could not update investigation: {error}")
 
-                if save:
-                    updated = update_investigation(
-                        incident,
-                        status=new_status,
-                        notes=new_notes,
-                    )
-
-                    # Persist changes before updating the session
-                    save_investigation(updated)
-
-                    incident_index = st.session_state.investigations.index(
-                        incident
-                    )
-                    st.session_state.investigations[incident_index] = updated
-
-                    st.success("Investigation saved permanently.")
-                    st.rerun()
-
-# Evidence Integrity
-st.divider()
-st.header("🔐 Evidence Integrity Verification")
-
-st.write(
-    "Upload a file to calculate its SHA-256 fingerprint. "
-    "Compare it with a trusted fingerprint to check whether "
-    "the file contents match."
-)
-
-uploaded_file = st.file_uploader(
-    "Choose an evidence file",
-    key="evidence_file",
-)
-
-if uploaded_file is not None:
-    file_bytes = uploaded_file.getvalue()
-    current_hash = hashlib.sha256(file_bytes).hexdigest()
-
-    st.write("**File name:**", uploaded_file.name)
-    st.write("**SHA-256 fingerprint:**")
-    st.code(current_hash)
-
-    expected_hash = st.text_input(
-        "Enter the trusted SHA-256 fingerprint",
-        placeholder="Paste the original fingerprint here",
+    st.caption(
+        "Investigations are saved in cloudsentry.db. "
+        "They should remain available after a browser refresh or app restart."
     )
 
-    if st.button("Verify Evidence Integrity"):
-        if not expected_hash.strip():
-            st.warning("Please enter the trusted fingerprint.")
-        elif current_hash.lower() == expected_hash.strip().lower():
-            st.success(
-                "Fingerprint matches. The uploaded file matches "
-                "the supplied fingerprint."
-            )
-        else:
-            st.error(
-                "Fingerprint mismatch. The uploaded file does not "
-                "match the supplied fingerprint."
-            )
+# --------------------------------------------------
+# 11. EVIDENCE INTEGRITY
+# --------------------------------------------------
+elif page == "Evidence Integrity":
+    hero(
+        "Evidence Integrity",
+        "Generate a SHA-256 fingerprint to help verify whether "
+        "the currently loaded event evidence has changed.",
+    )
 
-# Prototype status
+    fingerprint = evidence_hash(events)
+
+    st.markdown("### Evidence fingerprint")
+    st.code(fingerprint, language="text")
+
+    st.caption(
+        "Algorithm: SHA-256 · Input: normalized JSON representation "
+        "of the currently loaded event list."
+    )
+
+    if st.button("Recalculate fingerprint"):
+        st.rerun()
+
+    st.markdown("### Evidence details")
+
+    col1, col2 = st.columns(2)
+    col1.metric("Events Included", len(events))
+    col2.metric("Fingerprint Length", len(fingerprint))
+
+    st.warning(
+        "A matching fingerprint can help detect changes to the same "
+        "serialized evidence. It does not independently prove when, "
+        "where, or by whom the evidence was collected."
+    )
+
+# --------------------------------------------------
+# 12. FOOTER
+# --------------------------------------------------
 st.divider()
+
 st.caption(
-    "CloudSentry prototype using sample JSON events and SQLite "
-    "for persistent investigation records. Live AWS integration "
-    "is not enabled yet."
+    f"CloudSentry Security Operations · Data source: {source_label} · "
+    "Rule-based detection prototype"
 )
