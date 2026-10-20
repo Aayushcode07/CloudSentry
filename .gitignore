@@ -1,3 +1,9 @@
+# Local investigation database
+cloudsentry.db
+
+# Temporary evidence test files
+sample-data/clean_evidence.txt
+sample-data/evidence_test.txt
 # Python
 __pycache__/
 *.py[cod]
